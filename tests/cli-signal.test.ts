@@ -107,6 +107,7 @@ test("startup timeout cleans up its report directory", async () => {
 });
 
 test("status retains credential-read failures without pretending the healthy process is stopped", async () => {
+  if (process.platform === "win32") return; // chmod cannot express Windows ACL permissions.
   const { config } = await fixture();
   await chmod(config.controlPath, 0o644);
   expect(await statusDaemon(config)).toMatchObject({ running: true, controlIssue: { diagnostic: { code: "control_permissions_unsafe" } } });

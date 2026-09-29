@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import { JSDOM } from "jsdom";
 import { folioHtml } from "../src/web/folio-page";
+import type { EmbeddedBrowserHost, HostEventSource } from "../src/web/embedded-host";
 
-function runPage(snapshot: Record<string, unknown>, savedView?: string) {
+function runPage(snapshot: Record<string, unknown>, savedView?: string, configure?: (window: JSDOM["window"]) => void) {
   const html = folioHtml({ pickerAvailable: true });
   const dom = new JSDOM(html, { runScripts: "outside-only", url: "http://127.0.0.1/r/test/" });
   Object.defineProperty(dom.window.HTMLDialogElement.prototype, "showModal", { configurable: true, value: function(this: HTMLDialogElement) { this.open = true; } });
@@ -38,11 +39,50 @@ function runPage(snapshot: Record<string, unknown>, savedView?: string) {
     }
     return Response.json({ ok: true });
   } });
+  configure?.(dom.window);
   const script = dom.window.document.querySelector("script")?.textContent;
   if (!script) throw new Error("Folio script missing");
   dom.window.eval(script);
   return { dom, html, requests, events: () => FakeEventSource.instance };
 }
+
+test("embedded Folio loads and receives updates entirely through its host, then returns and closes events", async () => {
+  let nativeCalls = 0;
+  let returns = 0;
+  const openedDocuments: string[] = [];
+  const requested: string[] = [];
+  const snapshot = { sequence: 1, files: [{ path: "/notes.md", name: "Host notes", view: "active" }], instanceId: "embedded" };
+  const { dom, events } = runPage(snapshot, undefined, window => {
+    Object.defineProperty(window, "Request", { value: Request });
+    Object.defineProperty(window, "AbortSignal", { value: AbortSignal });
+    Object.defineProperty(window, "AbortController", { value: AbortController });
+    Object.defineProperty(window, "fetch", { value: async () => { nativeCalls++; throw new Error("Network disabled"); } });
+    const Events = (window as unknown as { EventSource: new (url: string) => HostEventSource }).EventSource;
+    const host: EmbeddedBrowserHost = {
+      version: 1, baseUrl: "https://logical.invalid/r/embedded/",
+      request: async request => { requested.push(request.url); return Response.json(request.url.endsWith("/snapshot") ? snapshot : request.url.endsWith("/open") ? { launchUrl: "https://logical.invalid/launch?ticket=private" } : { ok: true }); },
+      events: url => { expect(url).toBe("https://logical.invalid/r/embedded/api/events"); return new Events(url); },
+      navigation: { label: "Back to Example", returnToHost() { returns++; }, openDocument(url) { openedDocuments.push(url); } },
+    };
+    Object.defineProperty(window, "tetherEmbeddedHost", { value: host });
+  });
+  try {
+    await Bun.sleep(0);
+    expect(requested).toContain("https://logical.invalid/r/embedded/api/snapshot");
+    events().emit({ sequence: 2, files: [{ path: "/notes.md", name: "Host notes", view: "active" }] });
+    expect(dom.window.document.querySelector(".name")?.textContent).toBe("Host notes");
+    dom.window.document.querySelector<HTMLButtonElement>(".file")!.click();
+    await Bun.sleep(0);
+    expect(openedDocuments).toEqual(["https://logical.invalid/launch?ticket=private"]);
+    const back = [...dom.window.document.querySelectorAll("button")].find(button => button.textContent === "Back to Example")!;
+    back.click();
+    await Bun.sleep(0);
+    expect(returns).toBe(1);
+    expect(nativeCalls).toBe(0);
+    dom.window.dispatchEvent(new dom.window.PageTransitionEvent("pagehide", { persisted: false }));
+    expect(events().closed).toBe(true);
+  } finally { dom.window.close(); }
+});
 
 test("Folio retains the original recovery dialog if refreshing after an action failure disconnects", async () => {
   const file = { path: "/notes.md", name: "Notes", view: "active", hasConversation: true };
