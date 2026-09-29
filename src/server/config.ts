@@ -108,7 +108,11 @@ export async function removeDiscovery(config: TetherConfig, instanceId?: string)
 export async function readControlToken(config: TetherConfig): Promise<string | null> {
   try {
     const info = await stat(config.controlPath);
-    if ((info.mode & 0o077) !== 0) throw Object.assign(new Error("Unsafe daemon control credential permissions."), { code: "control_permissions_unsafe" });
+    // Windows stat mode does not represent the file's ACL (Bun reports 0666
+    // even when the token is in a user-owned profile). Check POSIX bits only.
+    if (process.platform !== "win32" && (info.mode & 0o077) !== 0) {
+      throw Object.assign(new Error("Unsafe daemon control credential permissions."), { code: "control_permissions_unsafe" });
+    }
     const token = (await readFile(config.controlPath, "utf8")).trim();
     if (!/^[A-Za-z0-9_-]{40,}$/.test(token)) throw Object.assign(new Error("Invalid daemon control credential."), { code: "control_invalid" });
     return token;

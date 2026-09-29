@@ -44,8 +44,19 @@ const DEFAULT_IDLE_MS = 5_000;
 
 export type Clock = () => number;
 export type Ticket = { ticket: string; url: string; expiresAt: number };
-export type Session = { id: string; grant: DocumentSession; cookie: string; verifier?: string; createdAt: number; lastSeen: number; leases: Map<string, number>; target?: HostTarget };
-type RecentsSession = { id: string; cookie: string; verifier?: string; createdAt: number; lastSeen: number; leaseUntil: number; target?: HostTarget };
+export type Session = { id: string; grant: DocumentSession; cookie: string; verifier?: string; createdAt: number; lastSeen: number; leases: Map<string, number>; target?: HostTarget; hostPrincipal?: string };
+type RecentsSession = { id: string; cookie: string; verifier?: string; createdAt: number; lastSeen: number; leaseUntil: number; target?: HostTarget; hostPrincipal?: string };
+
+/** One isolated Tether profile belongs to one host principal. The host decides
+ * how to authenticate a forwarded request and which canonical Markdown files
+ * that principal may access. Both callbacks must fail closed. */
+export type EmbeddedServerHost = {
+  principal: string;
+  authenticate(request: Request): string | null | Promise<string | null>;
+  authorizeDocument(principal: string, canonicalPath: string, method: string): boolean | Promise<boolean>;
+  /** Grants the whole profile, including Folio list and profile-wide actions. */
+  authorizeFolio?(principal: string, method: string): boolean | Promise<boolean>;
+};
 
 export type DaemonOptions = {
   config?: TetherConfig;
@@ -53,6 +64,7 @@ export type DaemonOptions = {
   service?: DocumentService;
   recents?: RecentsRegistry;
   hostAdapter?: HostAdapter;
+  embeddedHost?: EmbeddedServerHost;
   now?: Clock;
   ticketMs?: number;
   leaseMs?: number;
@@ -233,6 +245,8 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
   const trashFile = options.trashFile ?? moveToTrash;
   const pickFiles = options.pickFiles ?? (process.platform === "darwin" ? pickMarkdownFiles : undefined);
   const hostAdapter = options.hostAdapter ?? new HostGateway(config, createBrowserHost({ open: options.opener }));
+  const embeddedHost = options.embeddedHost;
+  if (embeddedHost && (!embeddedHost.principal || !embeddedHost.principal.trim())) throw new Error("An embedded host must name its profile principal.");
   const recents = new RecentsService(options.recents ?? new RecentsRegistry({ path: config.recentsPath, now, database: privateStore.db, deletePrivateData: async (path: string, onlyWithoutConversation?: boolean) => {
     agentReads.forget(path);
     await service.deleteConversation(path, onlyWithoutConversation);
@@ -297,6 +311,16 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
     const expiresAt = now() + ticketMs;
     recentsTickets.set(ticket, { expiresAt, target });
     return { ticket, expiresAt, url: `${daemon.origin}/recents/launch?ticket=${encodeURIComponent(ticket)}` };
+  }
+
+  async function hostAllowsDocument(principal: string, path: string, method: string): Promise<boolean> {
+    try { return (await embeddedHost?.authorizeDocument(principal, path, method)) === true; }
+    catch { return false; }
+  }
+
+  async function hostAllowsFolio(principal: string, method: string): Promise<boolean> {
+    try { return (await embeddedHost?.authorizeFolio?.(principal, method)) === true; }
+    catch { return false; }
   }
 
   function recentsEventStream(request: Request): Response {
@@ -374,6 +398,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
   }
 
   async function folioOperation(action: string, body: Record<string, unknown>, target?: HostTarget, browser = false): Promise<unknown> {
+    if (embeddedHost && action === "service") throw new DocumentAccessError("The embedding host controls this service.");
     const paths = Array.isArray(body.paths) && body.paths.every(p => typeof p === "string") ? body.paths as string[] : typeof body.path === "string" ? [body.path] : [];
     if (paths.length > 200) throw invalidRequest("Select no more than 200 documents at once.");
     if (action === "list") return { ...await recents.folioSnapshot(body as ListFolioOptions), instanceId };
@@ -456,6 +481,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
   }
 
   async function updateRequest(request: Request, suffix: string): Promise<Response | undefined> {
+      if (embeddedHost && suffix.startsWith("/api/updates")) return error("host_managed_update", "The embedding host manages updates.", 404);
       if (request.method === "GET" && suffix === "/api/updates/skills") return json(await listAgentSkillReviews(config), { headers: { "cache-control": "no-store" } });
       if (request.method === "POST" && ["/api/updates/skills/read", "/api/updates/skills/decide"].includes(suffix)) {
         if (!sameOrigin(request, daemon.origin)) return error("origin_mismatch", "State-changing requests must use the daemon origin.", 403);
@@ -619,6 +645,8 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
         if (body.format !== undefined && body.format !== "markdown" && body.format !== "wikilink") throw invalidRequest("Invalid link format.");
         const path = await service.resolveWikilink(session.grant.path, body.target, body.format);
         const sourceUrl = `${daemon.origin}/s/${session.id}/`;
+        if (embeddedHost && (!session.hostPrincipal || ![".md", ".markdown"].includes(extname(path).toLowerCase()) ||
+            !(await hostAllowsDocument(session.hostPrincipal, await realpath(path), "GET")))) throw new DocumentAccessError();
         if (![".md", ".markdown"].includes(extname(path).toLowerCase())) {
           if (session.target?.host === "cmux") {
             if (!hostAdapter.openLocalFile) throw invalidRequest("Native local-file opening is unavailable in this host.");
@@ -631,6 +659,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
         }
         const grant = await service.open(path);
         const ticket = mintTicket(grant, session.target);
+        if (embeddedHost) return json({ path: grant.path, resolvedPath: grant.realPath, opened: true, launchUrl: ticket.url });
         try { await hostAdapter.openView({ url: ticket.url, kind: "document", focus: true, target: session.target,
           ...(session.target?.host === "cmux" ? { targetPolicy: "source-pane" as const, sourceUrl } : {}),
         }); }
@@ -669,6 +698,32 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
     // browser must not mistake that interval for revoked authorization.
     try { await ready; } catch { return error("service_unavailable", "Tether could not finish starting.", 503); }
     if (stopped) return error("service_stopping", "Tether is restarting.", 503);
+    let hostPrincipal: string | undefined;
+    if (embeddedHost && !pathname.startsWith("/control/")) {
+      try { hostPrincipal = (await embeddedHost.authenticate(request)) ?? undefined; }
+      catch { return error("host_unauthorized", "Host authentication failed.", 401); }
+      if (hostPrincipal !== embeddedHost.principal) return error("host_unauthorized", "Host authentication is required.", 401);
+      if (pathname.startsWith("/r/") || pathname === "/recents/launch") {
+        if (!(await hostAllowsFolio(hostPrincipal, request.method))) return error("host_forbidden", "The host denied this Folio profile.", 403);
+        if (pathname.startsWith("/r/")) {
+          const id = /^\/r\/([^/]+)(?:\/|$)/.exec(pathname)?.[1];
+          const session = id ? recentsSessions.get(id) : undefined;
+          if (session && session.hostPrincipal !== hostPrincipal) return error("host_forbidden", "The host denied this Folio profile.", 403);
+        }
+      }
+      if (pathname === "/launch") {
+        const ticket = url.searchParams.get("ticket");
+        const pending = ticket ? tickets.get(ticket) : undefined;
+        if (pending && !(await hostAllowsDocument(hostPrincipal, pending.grant.realPath, request.method))) return error("host_forbidden", "The host denied this document.", 403);
+      }
+      if (pathname.startsWith("/s/")) {
+        const id = /^\/s\/([^/]+)(?:\/|$)/.exec(pathname)?.[1];
+        const session = id ? sessions.get(id) : undefined;
+        if (session && (session.hostPrincipal !== hostPrincipal || !(await hostAllowsDocument(hostPrincipal, session.grant.realPath, request.method)))) {
+          return error("host_forbidden", "The host denied this document.", 403);
+        }
+      }
+    }
     if (pathname === "/favicon.png" && request.method === "GET") {
       return new Response(await readFile(resolve(runtimeRoot(), process.env.TETHER_INSTALL_ROOT ? "dist/favicon.png" : "src/web/favicon.png")), {
         headers: { "content-type": "image/png", "cache-control": "public, max-age=3600", "x-content-type-options": "nosniff" },
@@ -690,7 +745,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
       }
       const id = pending.resumeId ?? randomToken();
       const createdAt = now();
-      const session: Session = { id, grant: pending.grant, cookie: randomToken(), createdAt, lastSeen: createdAt, leases: new Map(), ...(pending.target ? { target: pending.target } : {}) };
+      const session: Session = { id, grant: pending.grant, cookie: randomToken(), createdAt, lastSeen: createdAt, leases: new Map(), ...(pending.target ? { target: pending.target } : {}), ...(hostPrincipal ? { hostPrincipal } : {}) };
       const previous = sessions.get(id);
       try { await recents.record(pending.grant.realPath, pending.target); }
       catch (cause) {
@@ -720,7 +775,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
       if (pending.expiresAt <= now()) return error("ticket_expired", "The Recents launch ticket has expired.", 401);
       const id = randomToken();
       const createdAt = now();
-      const session: RecentsSession = { id, cookie: randomToken(), createdAt, lastSeen: createdAt, leaseUntil: createdAt + leaseMs, ...(pending.target ? { target: pending.target } : {}) };
+      const session: RecentsSession = { id, cookie: randomToken(), createdAt, lastSeen: createdAt, leaseUntil: createdAt + leaseMs, ...(pending.target ? { target: pending.target } : {}), ...(hostPrincipal ? { hostPrincipal } : {}) };
       recentsSessions.set(id, session);
       views.put({ id, kind: "folio", path: null, verifier: cookieVerifier(session.cookie), createdAt, target: session.target });
       const root = `/r/${encodeURIComponent(id)}/`;
@@ -739,7 +794,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
       const suffix = `/${match![2]}`;
       if (request.method === "GET" && suffix === "/") {
         const prefs = await preferences();
-        return new Response(folioHtml({ pickerAvailable: Boolean(pickFiles), locateFiles: Boolean(pickFiles), theme: prefs.theme, design: prefs.customThemes?.find(theme => theme.id === prefs.theme) }), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+        return new Response(folioHtml({ pickerAvailable: !embeddedHost && Boolean(pickFiles), locateFiles: !embeddedHost && Boolean(pickFiles), importPackages: !embeddedHost, serviceControls: !embeddedHost, theme: prefs.theme, design: prefs.customThemes?.find(theme => theme.id === prefs.theme) }), { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
       }
       if (request.method === "GET" && suffix === "/api/files") return json(await recents.files());
       const updateResponse = await updateRequest(request, suffix);
@@ -777,8 +832,10 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
           if (typeof body.path !== "string") throw invalidRequest("A recent Markdown path is required.");
           if (suffix === "/api/welcome") await recents.record(body.path, session.target);
           const canonical = await folioFile(body.path);
+          if (embeddedHost && (!hostPrincipal || !(await hostAllowsDocument(hostPrincipal, canonical, "GET")))) throw new DocumentAccessError();
           const grant = await service.open(canonical);
           const launch = mintTicket(grant, session.target);
+          if (embeddedHost) return json({ opened: true, path: grant.path, launchUrl: launch.url });
           try {
             await hostAdapter.openView({
               url: launch.url,
@@ -1067,7 +1124,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
       if (stopped) return;
       if (options.persistentViews) {
         for (const view of views.list()) {
-          if (view.kind === "folio") recentsSessions.set(view.id, { id: view.id, cookie: "", verifier: view.verifier, createdAt: view.createdAt, lastSeen: now(), leaseUntil: now() + leaseMs, target: view.target });
+          if (view.kind === "folio") recentsSessions.set(view.id, { id: view.id, cookie: "", verifier: view.verifier, createdAt: view.createdAt, lastSeen: now(), leaseUntil: now() + leaseMs, target: view.target, ...(embeddedHost ? { hostPrincipal: embeddedHost.principal } : {}) });
           else if (view.path) {
             try {
               if (await realpath(view.path) !== view.path) throw new DocumentAccessError();
@@ -1075,7 +1132,7 @@ export function createDaemon(options: DaemonOptions = {}): TetherDaemon {
               if (view.parent && (parent.dev !== view.parent.dev || parent.ino !== view.parent.ino)) throw new DocumentAccessError();
               const grant = await service.open(view.path);
               if (!view.parent) views.put({ ...view, parent: { dev: parent.dev, ino: parent.ino } });
-              sessions.set(view.id, { id: view.id, grant, cookie: "", verifier: view.verifier, createdAt: view.createdAt, lastSeen: now(), leases: new Map(), target: view.target });
+              sessions.set(view.id, { id: view.id, grant, cookie: "", verifier: view.verifier, createdAt: view.createdAt, lastSeen: now(), leases: new Map(), target: view.target, ...(embeddedHost ? { hostPrincipal: embeddedHost.principal } : {}) });
             }
             catch { /* Missing files remain available in Folio for Locate file. */ }
           }

@@ -1,7 +1,7 @@
 import type { AgentSkillReview } from "../cli/agent-skills";
 
 /** Serialized into the standalone Folio page; keep this function self-contained. */
-export function mountUpdateNotice(element: HTMLElement, api: string, reportError?: (message: string) => void, beforeInstall?: () => Promise<void>, reload = true, menuCheck?: HTMLButtonElement, packageButton?: HTMLButtonElement): void {
+export function mountUpdateNotice(element: HTMLElement, api: string, reportError?: (message: string) => void, beforeInstall?: () => Promise<void>, reload = true, menuCheck?: HTMLButtonElement, packageButton?: HTMLButtonElement, request: (input: string, init?: RequestInit) => Promise<Response> = (input, init) => fetch(input, init)): void {
   let popupOpen = false;
   const closePopup = () => {
     popupOpen = false;
@@ -27,11 +27,11 @@ export function mountUpdateNotice(element: HTMLElement, api: string, reportError
   let finishReview: (() => void) | undefined;
   const message = (text: string) => { element.hidden = false; element.textContent = text; };
   const post = async (action: string, tag: string) => {
-    const response = await fetch(`${api}/updates/${action}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tag }) });
+    const response = await request(`${api}/updates/${action}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tag }) });
     if (!response.ok) throw new Error("Update action failed");
   };
   const skillRequest = async (action: string, body?: unknown) => {
-    const response = await fetch(`${api}/updates/skills${action}`, { cache: "no-store", ...(body === undefined ? {} : {
+    const response = await request(`${api}/updates/skills${action}`, { cache: "no-store", ...(body === undefined ? {} : {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
     }) });
     const result = await response.json();
@@ -205,7 +205,7 @@ export function mountUpdateNotice(element: HTMLElement, api: string, reportError
     if (document.hidden && !force) return;
     pending = true;
     try {
-      const response = await fetch(`${api}/updates${force ? "/check" : ""}`, { cache: "no-store", ...(force ? { method: "POST", headers: { "content-type": "application/json" }, body: "{}" } : {}), signal: AbortSignal.timeout(30_000) });
+      const response = await request(`${api}/updates${force ? "/check" : ""}`, { cache: "no-store", ...(force ? { method: "POST", headers: { "content-type": "application/json" }, body: "{}" } : {}), signal: AbortSignal.timeout(30_000) });
       if (!response.ok) throw new Error("Unavailable");
       const state = await response.json();
       last = state;

@@ -22,6 +22,7 @@ import { documentTabTitle, filenameStem } from "./document-title";
 import { DraftPersistence, recoverDraft } from "./draft-recovery";
 import { createReconnectLoop } from "./reconnect";
 import { installCmuxFindCompatibility } from "./hosts/cmux-find";
+import { browserHostServices, mountHostReturn } from "./embedded-host";
 import type { SessionBootstrap } from "../shared/contracts";
 import "./annotations-ui.css";
 import "./chrome.css";
@@ -61,6 +62,7 @@ const targetActor = "assistant";
 
 const notice = document.querySelector<HTMLElement>("#notice")!;
 const toolbarControls = document.querySelector<HTMLElement>("#toolbar-controls")!;
+const hostServices = browserHostServices();
 const themeButton = document.querySelector<HTMLButtonElement>("#theme")!;
 const themeMenu = document.querySelector<HTMLElement>("#theme-menu")!;
 const zoomButton = document.querySelector<HTMLButtonElement>("#zoom")!;
@@ -236,7 +238,7 @@ function labelCrepeTools(): void {
 }
 
 async function fetchResponse(pathname: string, init: RequestInit = {}): Promise<Response> {
-  const response = await fetch(apiPath(pathname), {
+  const response = await hostServices.fetch(apiPath(pathname), {
     ...init,
     signal: init.signal ?? AbortSignal.timeout(10_000),
     credentials: "same-origin",
@@ -252,7 +254,7 @@ async function fetchResponse(pathname: string, init: RequestInit = {}): Promise<
 }
 
 async function loadDocument(): Promise<DocumentResponse> {
-  const response = await fetch(apiPath("api/file"), { credentials: "same-origin", signal: AbortSignal.timeout(10_000) });
+  const response = await hostServices.fetch(apiPath("api/file"), { credentials: "same-origin", signal: AbortSignal.timeout(10_000) });
   if (response.ok || response.status === 422) return await response.json() as DocumentResponse;
   const text = await response.text();
   throw new Error(text || response.statusText);
@@ -677,9 +679,14 @@ editorRoot.addEventListener("click", (event) => {
   if (!link || !target) return;
   event.preventDefault();
   event.stopPropagation();
-  void api("api/open", {
+  void api<{ launchUrl?: string }>("api/open", {
     method: "POST",
     body: JSON.stringify(target),
+  }).then(async result => {
+    if (hostServices.navigation && result.launchUrl) {
+      if (!hostServices.navigation.openDocument) throw new Error("The host cannot open documents.");
+      await hostServices.navigation.openDocument(result.launchUrl);
+    }
   }).catch((error) => chrome.setNotice(`Could not open link: ${(error as Error).message}`, 0));
 }, true);
 document.addEventListener("keydown", (event) => {
@@ -704,7 +711,9 @@ addEventListener("pagehide", event => {
   persistPosition(true);
   connection.pause();
   const body = new Blob([JSON.stringify({ clientId })], { type: "application/json" });
-  navigator.sendBeacon(apiPath("api/release"), body);
+  if (hostServices.navigation) {
+    void hostServices.fetch(apiPath("api/release"), { method: "POST", body, keepalive: true }).catch(() => {});
+  } else navigator.sendBeacon(apiPath("api/release"), body);
   if ((event as PageTransitionEvent).persisted) return;
   connection.dispose();
   selectionUi?.destroy();
@@ -733,7 +742,10 @@ const updateNotice = document.createElement("aside");
 updateNotice.id = "update-notice";
 updateNotice.hidden = true;
 updateNotice.setAttribute("aria-live", "polite");
-mountUpdateNotice(updateNotice, new URL("api", location.href).pathname, message => chrome.setNotice(message), async () => {
+mountHostReturn(toolbarControls, hostServices.navigation, async () => {
+  if (initialized) await persistDraft(true);
+}, message => chrome.setNotice(message), "wm-comment-button wm-host-return");
+if (!hostServices.navigation) mountUpdateNotice(updateNotice, new URL("api", location.href).pathname, message => chrome.setNotice(message), async () => {
   if (!initialized || initializing || switching) throw new Error("Wait for the document to finish loading.");
   await persistDraft(true);
-}, false, undefined, updateButton);
+}, false, undefined, updateButton, hostServices.fetch);
